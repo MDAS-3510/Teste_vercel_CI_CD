@@ -1,14 +1,22 @@
 # =============================================================================
 # PIPELINE PRINCIPAL: CI (build + testes) -> CD (deploy na Vercel)
-#   • Pull Request -> deploy de PREVIEW (URL temporária comentada no PR)
-#   • Push na main -> deploy de PRODUÇÃO (com aprovação manual opcional)
+#   • Pull Request -> deploy de PREVIEW
+#   • Push na main -> deploy de PRODUÇÃO
 #
-# Segredos necessários (Settings > Secrets and variables > Actions):
-#   VERCEL_TOKEN        token criado em vercel.com/account/tokens
-#   VERCEL_ORG_ID       está em .vercel/project.json após `vercel link`
-#   VERCEL_PROJECT_ID   idem
+# Secrets necessários (Settings > Secrets and variables > Actions > aba "Secrets"):
+#   VERCEL_TOKEN
+#   VERCEL_ORG_ID
+#   VERCEL_PROJECT_ID
+#   VERCEL_AUTOMATION_BYPASS_SECRET
+#     (Vercel > Project Settings > Deployment Protection >
+#      Protection Bypass for Automation)
+#
+# Atenção: PRs abertos pelo Dependabot NÃO recebem os secrets do Actions (eles
+# usam um cofre separado, o "Dependabot secrets"). Por isso o deploy de preview
+# é pulado para eles; o CI (testes + build) continua rodando normalmente.
 # =============================================================================
-name: Pipeline
+
+name: Pipeline CI/CD - Vercel
 
 on:
   pull_request:
@@ -17,7 +25,7 @@ on:
     branches: [main]
   workflow_dispatch:
 
-# Deploys da mesma branch entram em fila (não cancelamos deploy no meio!)
+# Deploys da mesma branch entram em fila (sem cancelar o que já está rodando).
 concurrency:
   group: pipeline-${{ github.ref }}
   cancel-in-progress: false
@@ -26,98 +34,210 @@ permissions:
   contents: read
 
 env:
+  VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
   VERCEL_ORG_ID: ${{ secrets.VERCEL_ORG_ID }}
   VERCEL_PROJECT_ID: ${{ secrets.VERCEL_PROJECT_ID }}
 
 jobs:
-  # ------------------------------------------- Espera o CI passar antes de publicar
-  # Reaproveita as mesmas verificações chamando o workflow CI.
+  # ---------------------------------------------------------------------------
+  # CI: testes, qualidade e build
   checks:
-    name: Rodar CI antes do deploy
+    name: Testes e build
     uses: ./.github/workflows/ci.yml
 
-  # ----------------------------------------------------------------- PREVIEW (PR)
+  # ---------------------------------------------------------------------------
+  # PREVIEW: Pull Request
   preview:
     name: Deploy Preview
-    # PRs vindos de forks não recebem segredos, então não dá para fazer deploy
-    if: github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository
     needs: checks
+    # Só PRs de dentro do próprio repositório (forks não recebem secrets) e que
+    # não sejam do Dependabot (também não recebe secrets do Actions).
+    if: >-
+      github.event_name == 'pull_request' &&
+      github.event.pull_request.head.repo.full_name == github.repository &&
+      github.actor != 'dependabot[bot]'
     runs-on: ubuntu-latest
     timeout-minutes: 10
+
     permissions:
       contents: read
-      pull-requests: write        # para comentar a URL no PR
+      pull-requests: write
+
     environment:
       name: preview
-    outputs:
-      url: ${{ steps.deploy.outputs.url }}
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - run: npm ci
-      - name: Instala a CLI da Vercel
+
+      - name: Instalar Vercel CLI
         run: npm install --global vercel@latest
-      - name: Baixa configuração do projeto (preview)
-        run: vercel pull --yes --environment=preview --token=${{ secrets.VERCEL_TOKEN }}
-      - name: Build
-        run: vercel build --token=${{ secrets.VERCEL_TOKEN }}
-      - name: Pipeline
+
+      # Lista TODOS os secrets vazios (não só o primeiro) e mostra quem disparou
+      # a execução. Os valores nunca são impressos: só "configurado" ou "vazio".
+      - name: Validar secrets da Vercel
+        shell: bash
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+          ACTOR: ${{ github.actor }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          faltando=0
+          for nome in VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID VERCEL_AUTOMATION_BYPASS_SECRET; do
+            if [ -z "${!nome}" ]; then
+              echo "::error::$nome está vazio"
+              faltando=1
+            else
+              echo "✔ $nome configurado"
+            fi
+          done
+          if [ "$faltando" -eq 1 ]; then
+            echo "Disparado por: $ACTOR | evento: $EVENT | ambiente: preview"
+            echo "Dica: se TODOS estiverem vazios, os secrets não estão chegando a esta execução"
+            echo "(ator dependabot[bot], fork, repositório errado ou cadastrados na aba Variables)."
+            exit 1
+          fi
+
+      - name: Baixar configurações do Preview
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: vercel pull --yes --environment=preview --token="$VERCEL_TOKEN"
+
+      - name: Build do Preview
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: vercel build --token="$VERCEL_TOKEN"
+
+      - name: Deploy Preview
         id: deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        shell: bash
         run: |
-          URL=$(vercel deploy --prebuilt --token=${{ secrets.VERCEL_TOKEN }})
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-          echo "### 🔍 Preview: $URL" >> "$GITHUB_STEP_SUMMARY"
-      - name: Smoke test no preview
+          set -euo pipefail
+          DEPLOY_URL=$(vercel deploy --prebuilt --token="$VERCEL_TOKEN")
+          echo "url=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
+          echo "### 🔍 Preview: $DEPLOY_URL" >> "$GITHUB_STEP_SUMMARY"
+
+      # Sobre o `vercel curl` (testado na CLI 64.5.0):
+      #  - NÃO passe --token: a CLI repassa o flag ao curl ("option --token: is unknown").
+      #  - VERCEL_TOKEN precisa estar no env, senão a CLI aborta ("No existing credentials found").
+      #  - VERCEL_AUTOMATION_BYPASS_SECRET no env é lido pela CLI e enviado como header de bypass.
+      #  - --fail faz o step falhar em HTTP 4xx/5xx.
+      - name: Smoke test no Preview
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+          DEPLOY_URL: ${{ steps.deploy.outputs.url }}
+        shell: bash
         run: |
+          set -euo pipefail
           sleep 5
-          curl --fail --silent --show-error --retry 5 --retry-delay 3 "${{ steps.deploy.outputs.url }}/api/health"
-      - name: Comenta a URL no PR
+          vercel curl "$DEPLOY_URL/api/health" --fail --silent --show-error
+
+      - name: Comentar a URL no PR
         uses: actions/github-script@v7
+        env:
+          DEPLOY_URL: ${{ steps.deploy.outputs.url }}
         with:
           script: |
-            github.rest.issues.createComment({
+            const sha = context.payload.pull_request.head.sha.slice(0, 7);
+            await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
               issue_number: context.issue.number,
-              body: `🚀 **Preview pronto!**\n\n${{ steps.deploy.outputs.url }}\n\nCommit: \`${context.sha.slice(0, 7)}\``
-            })
+              body: `🚀 **Preview pronto!**\n\n${process.env.DEPLOY_URL}\n\nCommit: \`${sha}\``
+            });
 
-  # ------------------------------------------------------------ PRODUÇÃO (main)
+  # ---------------------------------------------------------------------------
+  # PRODUÇÃO: push na main
   production:
-    name: Deploy Produção
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    name: Deploy Production
     needs: checks
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Se o environment "production" tiver "Required reviewers",
-    # o job pausa aqui até alguém aprovar no GitHub.
+
     environment:
       name: production
       url: ${{ steps.deploy.outputs.url }}
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - name: Checkout do código
+        uses: actions/checkout@v4
+
+      - name: Configurar Node.js
+        uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-      - run: npm ci
-      - name: Instala a CLI da Vercel
+
+      - name: Instalar Vercel CLI
         run: npm install --global vercel@latest
-      - name: Baixa configuração do projeto (produção)
-        run: vercel pull --yes --environment=production --token=${{ secrets.VERCEL_TOKEN }}
-      - name: Build
-        run: vercel build --prod --token=${{ secrets.VERCEL_TOKEN }}
-      - name: Pipeline
+
+      # Mesma validação do Preview (lista todos os secrets vazios, sem imprimir valores).
+      - name: Validar secrets da Vercel
+        shell: bash
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+          ACTOR: ${{ github.actor }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          faltando=0
+          for nome in VERCEL_TOKEN VERCEL_ORG_ID VERCEL_PROJECT_ID VERCEL_AUTOMATION_BYPASS_SECRET; do
+            if [ -z "${!nome}" ]; then
+              echo "::error::$nome está vazio"
+              faltando=1
+            else
+              echo "✔ $nome configurado"
+            fi
+          done
+          if [ "$faltando" -eq 1 ]; then
+            echo "Disparado por: $ACTOR | evento: $EVENT | ambiente: production"
+            echo "Dica: se TODOS estiverem vazios, os secrets não estão chegando a esta execução"
+            echo "(repositório errado ou cadastrados na aba Variables em vez de Secrets)."
+            exit 1
+          fi
+
+      - name: Baixar configurações de Production
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: vercel pull --yes --environment=production --token="$VERCEL_TOKEN"
+
+      - name: Build de Production
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        run: vercel build --prod --token="$VERCEL_TOKEN"
+
+      - name: Deploy Production
         id: deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+        shell: bash
         run: |
-          URL=$(vercel deploy --prebuilt --prod --token=${{ secrets.VERCEL_TOKEN }})
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-          echo "### 🚀 Produção: $URL" >> "$GITHUB_STEP_SUMMARY"
+          set -euo pipefail
+          DEPLOY_URL=$(vercel deploy --prebuilt --prod --token="$VERCEL_TOKEN")
+          echo "url=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
+          echo "### 🚀 Produção: $DEPLOY_URL" >> "$GITHUB_STEP_SUMMARY"
+
+      # Mesmas regras do smoke test do Preview: sem --token, com VERCEL_TOKEN e
+      # VERCEL_AUTOMATION_BYPASS_SECRET no env, e --fail para falhar em HTTP 4xx/5xx.
       - name: Smoke test pós-deploy
+        env:
+          VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
+          VERCEL_AUTOMATION_BYPASS_SECRET: ${{ secrets.VERCEL_AUTOMATION_BYPASS_SECRET }}
+          DEPLOY_URL: ${{ steps.deploy.outputs.url }}
+        shell: bash
         run: |
+          set -euo pipefail
           sleep 5
-          curl --fail --silent --show-error --retry 5 --retry-delay 3 "${{ steps.deploy.outputs.url }}/api/health"
-          curl --fail --silent --show-error "${{ steps.deploy.outputs.url }}/api/hello?name=Deploy" | grep "Olá, Deploy!"
+
+          vercel curl "$DEPLOY_URL/api/health" --fail --silent --show-error
+
+          vercel curl "$DEPLOY_URL/api/hello?name=Deploy" --fail --silent --show-error | grep -F "Olá, Deploy!"
